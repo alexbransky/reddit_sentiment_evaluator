@@ -1,0 +1,11 @@
+requests
+pandas
+spacy
+nltk
+rapidfuzz
+python-dotenv
+tenacity
+streamlit
+altair
+# Optional: OpenAI API (only needed if you enable AI mode)
+openai>=1.30.0
