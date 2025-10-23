@@ -80,6 +80,19 @@ def fetch_comments(thread_url: str) -> List[Dict[str, Any]]:
 
 # --- Extraction (local) -------------------------------------------------------
 
+# Try to expand a short/partial movie name using the longest Title-Case span in the comment that contains it.
+TITLE_SPAN = re.compile(r"(?:\b(?:The|A|An|[A-Z][a-z0-9’']+)\b(?:\s+|$)){1,12}")
+
+def expand_movie_name_from_text(name: str, text: str) -> str:
+    n = name.strip()
+    if not n or len(n.split()) >= 3:
+        return n
+    cand = [m.group(0).strip() for m in TITLE_SPAN.finditer(text) if n.lower() in m.group(0).lower()]
+    if cand:
+        return max(cand, key=len)
+    return n
+
+
 QUOTED_TITLE = re.compile(r"[“\"']([^“\"']{2,80})[”\"']")
 TITLE_CASE_RUN = re.compile(r"(?:\b[A-Z][a-z0-9’']+(?:\s+|$)){1,6}")
 
@@ -154,11 +167,16 @@ JSON_SCHEMA = {
   "required":["results"]
 }
 
-SYSTEM_PROMPT = """You extract entities and sentiment from Reddit comments.
-- Identify MOVIES and PEOPLE only.
-- For each entity, decide sentiment from the author's perspective: positive, negative, or mixed (neutral/unclear -> mixed).
-- If no entities, return empty arrays.
-Return strict JSON following the schema.
+SYSTEM_PROMPT = """Extract entities and per-entity sentiment from each Reddit comment.
+
+Rules:
+- Only MOVIES and PEOPLE.
+- Use the movie's full official English title (keep leading articles, e.g., "The Shape of Water"; do not truncate to common nouns like "Water").
+- For PEOPLE, return the full name if present; do not append role words (director, actor).
+- Sentiment is from the author's perspective TOWARD EACH ENTITY: "positive", "negative", or "mixed".
+- If the language is clearly evaluative and strongly negative (e.g., "is trash", "sucks", "garbage", "awful", "hate"), classify as "negative".
+- If evidence is conflicting or ambiguous, use "mixed" (do NOT default to mixed when the text is clearly evaluative).
+- Return strict JSON for the provided schema.
 """
 
 @retry(wait=wait_exponential(min=1, max=20), stop=stop_after_attempt(4))
@@ -261,7 +279,15 @@ def aggregate(mentions: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     def summarize_counter(c: Counter):
         total = sum(c.values())
-        majority = c.most_common(1)[0][0] if total else "mixed"
+        if total == 0:
+            return {"counts": dict(c), "total": 0, "majority": "unclear"}
+
+        max_val = max(c.values())
+        top = [k for k, v in c.items() if v == max_val]
+
+        # If there is a tie (e.g., 2/2/2), mark as 'unclear'
+        majority = "unclear" if len(top) > 1 else top[0]
+
         return {"counts": dict(c), "total": total, "majority": majority}
 
     global_summary = [
@@ -292,6 +318,121 @@ def aggregate(mentions: List[Dict[str, Any]]) -> Dict[str, Any]:
 # --- Orchestrator -------------------------------------------------------------
 
 from typing import Optional
+
+import re
+
+# Cue lists (you can expand these over time)
+NEGATIVE_WORDS = [
+    "trash","garbage","awful","terrible","horrible","bad","worst","hate","hated",
+    "sucks","sucked","crap","pathetic","boring","dumb","stupid"
+]
+POSITIVE_WORDS = [
+    "amazing","awesome","great","fantastic","excellent","masterpiece","brilliant",
+    "love","loved","good"
+]
+
+# Idioms that are actually positive though they contain a negation
+POSITIVE_NEGATED_IDIOMS = [
+    r"\bnot\s+bad\b",
+    r"\bnot\s+too\s+bad\b",
+    r"\bnot\s+terrible\b",
+    r"\bnot\s+the\s+worst\b",
+]
+
+NEGATORS = {"not","no","never","hardly","barely","scarcely","isnt","isn't","wasnt","wasn't",
+            "arent","aren't","werent","weren't","dont","don't","doesnt","doesn't","didnt","didn't",
+            "cant","can't","couldnt","couldn't","shouldnt","shouldn't","wont","won't"}
+
+# Precompile
+_POS_RE = [re.compile(rf"\b{re.escape(w)}\b", re.I) for w in POSITIVE_WORDS]
+_NEG_RE = [re.compile(rf"\b{re.escape(w)}\b", re.I) for w in NEGATIVE_WORDS]
+_POS_NEGATED_IDIOMS_RE = [re.compile(p, re.I) for p in POSITIVE_NEGATED_IDIOMS]
+
+_WORD_RE = re.compile(r"[A-Za-z']+")
+
+def _normalize(text: str) -> str:
+    # unify contractions to a form we can scan
+    t = text.lower()
+    t = t.replace("’", "'")
+    # normalize common contractions to separate 'not'
+    t = (t.replace("isn't","is not").replace("wasn't","was not")
+           .replace("aren't","are not").replace("weren't","were not")
+           .replace("don't","do not").replace("doesn't","does not")
+           .replace("didn't","did not").replace("can't","can not")
+           .replace("couldn't","could not").replace("shouldn't","should not")
+           .replace("won't","will not"))
+    return t
+
+def _tokens_with_idx(text: str):
+    return [(m.group(0), m.start()) for m in _WORD_RE.finditer(text)]
+
+def _has_negator_before(tokens, hit_index, window=3) -> bool:
+    """Return True if a negator token occurs within `window` tokens before hit_index."""
+    start = max(0, hit_index - window)
+    for i in range(start, hit_index):
+        if tokens[i][0] in NEGATORS:
+            return True
+    return False
+
+def rule_based_sentiment(text: str) -> str | None:
+    """
+    Negation-aware override:
+      - If strong negative word present (and not negated) -> 'negative'
+      - If strong positive word present (and not negated) -> 'positive'
+      - If positive-negated idiom ('not bad', etc.) -> 'positive'
+      - If positive word is negated ('not great') -> 'negative'
+      - If negative word is negated ('not terrible') -> 'positive'
+      - Otherwise None (let the model decide)
+    """
+    if not text:
+        return None
+
+    t = _normalize(text)
+    toks = [w for (w, _) in _tokens_with_idx(t)]
+    # build map from token index to token for window checks
+    # simple scan using regex matches and token index math
+
+    # quick pass for idioms like 'not bad'
+    for r in _POS_NEGATED_IDIOMS_RE:
+        if r.search(t):
+            return "positive"
+
+    # find all token positions so we can detect negation windows
+    # Map word-start index -> token position
+    token_spans = list(_WORD_RE.finditer(t))
+    def token_pos_for_span(span_start):
+        # binary search not needed; linear is fine at comment size
+        for i, m in enumerate(token_spans):
+            if m.start() == span_start:
+                return i
+        return None
+
+    # Check negative words (un-negated)
+    for r in _NEG_RE:
+        for m in r.finditer(t):
+            pos = token_pos_for_span(m.start())
+            if pos is None:
+                continue
+            if not _has_negator_before([(m.group(0), m.start()) for m in token_spans], pos, window=3):
+                return "negative"
+            else:
+                # 'not terrible' → positive
+                return "positive"
+
+    # Check positive words (un-negated)
+    for r in _POS_RE:
+        for m in r.finditer(t):
+            pos = token_pos_for_span(m.start())
+            if pos is None:
+                continue
+            if not _has_negator_before([(m.group(0), m.start()) for m in token_spans], pos, window=3):
+                return "positive"
+            else:
+                # 'not great' → negative
+                return "negative"
+
+    return None
+
 
 def run_pipeline(
     thread_url: str,
@@ -343,16 +484,30 @@ def run_pipeline(
             for r in response_data.get("results", []):
                 cid = r["comment_id"]
                 source = by_id.get(cid, {})
+                text = source.get("body") or ""
+
+                # strong-rule sentiment from the raw comment
+                rule_sent = rule_based_sentiment(text)
+
                 for e in r.get("entities", []):
+                    raw_name = e["name"].strip()
+                    if e["entity_type"] == "movie":
+                        raw_name = expand_movie_name_from_text(raw_name, text)
+
+                    sent = e["sentiment"]
+                    if rule_sent and sent != rule_sent:
+                        sent = rule_sent  # e.g., "is trash" => negative
+
                     mentions.append({
                         "entity_type": e["entity_type"],
-                        "entity_name": e["name"].strip(),
-                        "sentiment": e["sentiment"],
+                        "entity_name": raw_name,
+                        "sentiment": sent,
                         "comment_id": cid,
                         "author": source.get("author"),
                         "permalink": source.get("permalink"),
-                        "text": source.get("body")
+                        "text": text
                     })
+
     else:
         # local path
         for c in comments:

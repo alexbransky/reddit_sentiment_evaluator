@@ -93,7 +93,8 @@ st.dataframe(global_aggs, use_container_width=True, hide_index=True)
 
 # Chart of top entities by total
 if global_aggs:
-    topN = st.slider("Top N (by mentions)", 5, min(50, len(global_aggs)), min(15, len(global_aggs)))
+    max_n = max(1, len(global_aggs))
+    topN = st.slider("Top N (by mentions)", 1, max_n, min(15, max_n))
     chart_data = [{"entity": f'{g["canonical_name"]} ({g["entity_type"][0]})', "sentiment": s, "count": g["counts"].get(s,0)}
                   for g in global_aggs[:topN] for s in ["positive","mixed","negative"]]
     chart = alt.Chart(alt.Data(values=chart_data)).mark_bar().encode(
