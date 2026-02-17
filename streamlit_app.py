@@ -2,7 +2,8 @@ import os, json
 import streamlit as st
 import altair as alt
 from dotenv import load_dotenv
-
+from tenacity import RetryError 
+from openai import RateLimitError
 from pipeline import run_pipeline
 
 load_dotenv()
@@ -14,8 +15,8 @@ with st.sidebar:
     st.header("Run Pipeline")
     reddit_url = st.text_input("Reddit thread URL", placeholder="https://www.reddit.com/r/.../comments/<id>/<slug>/", value="")
     use_ai = st.toggle("Use OpenAI (more accurate, costs money)", value=True)
-    model = st.text_input("OpenAI model", value=os.getenv("MODEL","gpt-4.1-mini"))
-    batch_size = st.number_input("AI batch size (comments per call)", min_value=1, max_value=25, value=10)
+    model = st.text_input("OpenAI model", value=os.getenv("MODEL","gpt-4o-mini"))
+    batch_size = st.number_input("AI batch size (comments per call)", min_value=1, max_value=25, value=3)
     require_tmdb = st.toggle("Validate movie titles via TMDB (recommended)", value=True, help="Requires TMDB_API_KEY in your .env")
     run_btn = st.button("Fetch & Analyze")
     uploaded_json = st.file_uploader("Or upload a results JSON", type=["json"])
@@ -30,8 +31,17 @@ if run_btn and reddit_url:
                 use_openai=use_ai,
                 openai_model=model,
                 batch_size=int(batch_size),
-                require_tmdb=require_tmdb
+                require_tmdb=require_tmdb,
             )
+        except RateLimitError:
+            st.error(
+                "OpenAI rate limit was hit while processing this thread.\n\n"
+                "Things you can try:\n"
+                "- Lower the AI batch size (already 3; you can also trim comments, see below).\n"
+                "- Turn off 'Use OpenAI' to use local sentiment only.\n"
+                "- Or wait a bit and try again."
+            )
+            results = None
         except Exception as e:
             st.error(f"Error: {e}")
             results = None
@@ -104,11 +114,6 @@ if global_aggs:
     ).properties(height=260)
     st.altair_chart(chart, use_container_width=True)
 
-st.subheader("By Author")
-author_aggs = results["aggregates"]["author_entity_sentiment"]
-if author_query:
-    author_aggs = [a for a in author_aggs if author_query.lower() in a["author"].lower()]
-st.dataframe(author_aggs, use_container_width=True, hide_index=True)
 
 st.subheader("Mentions (detailed)")
 st.caption("Each row is an entity mention tied to a single comment.")

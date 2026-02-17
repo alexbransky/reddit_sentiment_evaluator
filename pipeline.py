@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+import logging
 import os
 import re
 import json
@@ -7,6 +9,8 @@ from typing import List, Dict, Any, Tuple
 from collections import defaultdict, Counter
 
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception
+from openai import RateLimitError
+
 from rapidfuzz import fuzz
 
 # Local NLP (only used in non-OpenAI mode; keeps option available)
@@ -14,8 +18,14 @@ import spacy
 from nltk.sentiment import SentimentIntensityAnalyzer
 import nltk
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+
 # ---------- setup ----------
-USER_AGENT = "reddit-entity-sentiment/0.3 by yourname"
+USER_AGENT = "reddit-entity-sentiment/0.3 by alexbransky"
 
 # env
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
@@ -59,11 +69,11 @@ def fetch_comments(thread_url: str) -> List[Dict[str, Any]]:
             d = n.get("data", {})
             if kind == "t1":
                 body = d.get("body", "")
-                if body and body not in ("[deleted]","[removed]"):
+                if body and body not in ("[deleted]", "[removed]"):
                     comments.append({
                         "id": d.get("id"),
                         "author": d.get("author"),
-                        "permalink": "https://www.reddit.com" + d.get("permalink",""),
+                        "permalink": "https://www.reddit.com" + d.get("permalink", ""),
                         "score": d.get("score"),
                         "body": body
                     })
@@ -78,11 +88,11 @@ def fetch_comments(thread_url: str) -> List[Dict[str, Any]]:
 # ---------- Heuristics & helpers ----------
 
 # Titles to allow even though they are one word
-ONE_WORD_TITLE_ALLOWLIST = {"Her","Up","Gravity","Roma","Titanic","Amélie","Joker","Whiplash","Tár","Skyfall","Mank"}
+ONE_WORD_TITLE_ALLOWLIST = {"Her", "Up", "Gravity", "Roma", "Titanic", "Amélie", "Joker", "Whiplash", "Tár", "Skyfall", "Mank"}
 
 BAD_LEADS = re.compile(r"^(it'?s|im|i'?m|not|so|because|that|this|they|we|you|he|she)\b", re.I)
 TITLE_SPAN = re.compile(r"(?:\b(?:The|A|An|[A-Z][a-z0-9’']+)\b(?:\s+|$)){1,12}")
-QUOTED_TITLE = re.compile(r"[“\"']([^“\"']{2,80})[”\"']")
+QUOTED_TITLE = re.compile(r'[“"\']([^“"\']{2,80})[”"\']')
 
 def expand_movie_name_from_text(name: str, text: str) -> str:
     n = (name or "").strip()
@@ -105,13 +115,20 @@ def looks_like_title(name: str) -> bool:
     if len(parts) < 2 or len(parts) > 8:
         return False
     up_tokens = sum(1 for p in parts if p[:1].isupper())
-    if up_tokens < max(1, len(parts)//2):
+    if up_tokens < max(1, len(parts) // 2):
         return False
     return True
+
+# ---------- TMDB ----------
+
+# Cache to avoid redundant TMDB lookups for the same query within a run
+_tmdb_cache: dict[str, dict | None] = {}
 
 def tmdb_search_movie(query: str) -> dict | None:
     if not TMDB_API_KEY or not query:
         return None
+    if query in _tmdb_cache:
+        return _tmdb_cache[query]
     try:
         r = requests.get(
             "https://api.themoviedb.org/3/search/movie",
@@ -121,6 +138,7 @@ def tmdb_search_movie(query: str) -> dict | None:
         r.raise_for_status()
         data = r.json().get("results", [])
         if not data:
+            _tmdb_cache[query] = None
             return None
         # choose highest fuzzy score then popularity
         best = None
@@ -134,8 +152,10 @@ def tmdb_search_movie(query: str) -> dict | None:
                 best = item
                 best_score = score
                 best_pop = pop
+        _tmdb_cache[query] = best
         return best
     except Exception:
+        _tmdb_cache[query] = None
         return None
 
 def tmdb_canonical(item: dict) -> str:
@@ -148,12 +168,12 @@ def tmdb_canonical(item: dict) -> str:
 # ---------- Sentiment (rules) ----------
 
 NEGATIVE_WORDS = [
-    "trash","garbage","awful","terrible","horrible","bad","worst","hate","hated",
-    "sucks","sucked","crap","pathetic","boring","dumb","stupid"
+    "trash", "garbage", "awful", "terrible", "horrible", "bad", "worst", "hate", "hated",
+    "sucks", "sucked", "crap", "pathetic", "boring", "dumb", "stupid"
 ]
 POSITIVE_WORDS = [
-    "amazing","awesome","great","fantastic","excellent","masterpiece","brilliant",
-    "love","loved","good"
+    "amazing", "awesome", "great", "fantastic", "excellent", "masterpiece", "brilliant",
+    "love", "loved", "good"
 ]
 POSITIVE_NEGATED_IDIOMS = [
     r"\bnot\s+bad\b",
@@ -161,7 +181,7 @@ POSITIVE_NEGATED_IDIOMS = [
     r"\bnot\s+terrible\b",
     r"\bnot\s+the\s+worst\b",
 ]
-NEGATORS = {"not","no","never","hardly","barely","scarcely","is","are","was","were","do","does","did","can","could","should","will"}
+NEGATORS = {"not", "no", "never", "hardly", "barely", "scarcely", "is", "are", "was", "were", "do", "does", "did", "can", "could", "should", "will"}
 
 _WORD_RE = re.compile(r"[A-Za-z']+")
 _POS_RE = [re.compile(rf"\b{re.escape(w)}\b", re.I) for w in POSITIVE_WORDS]
@@ -169,13 +189,13 @@ _NEG_RE = [re.compile(rf"\b{re.escape(w)}\b", re.I) for w in NEGATIVE_WORDS]
 _POS_NEGATED_IDIOMS_RE = [re.compile(p, re.I) for p in POSITIVE_NEGATED_IDIOMS]
 
 def _normalize_neg(text: str) -> str:
-    t = text.lower().replace("’","'")
-    t = (t.replace("isn't","is not").replace("wasn't","was not")
-           .replace("aren't","are not").replace("weren't","were not")
-           .replace("don't","do not").replace("doesn't","does not")
-           .replace("didn't","did not").replace("can't","can not")
-           .replace("couldn't","could not").replace("shouldn't","should not")
-           .replace("won't","will not"))
+    t = text.lower().replace("\u2019", "'")
+    t = (t.replace("isn't", "is not").replace("wasn't", "was not")
+           .replace("aren't", "are not").replace("weren't", "were not")
+           .replace("don't", "do not").replace("doesn't", "does not")
+           .replace("didn't", "did not").replace("can't", "can not")
+           .replace("couldn't", "could not").replace("shouldn't", "should not")
+           .replace("won't", "will not"))
     return t
 
 def _token_spans(text: str):
@@ -204,7 +224,8 @@ def rule_based_sentiment(text: str) -> str | None:
             idx = None
             for i, s in enumerate(spans):
                 if s.start() == m.start():
-                    idx = i; break
+                    idx = i
+                    break
             if idx is None:
                 continue
             if _has_negator_before(spans, idx):
@@ -217,7 +238,8 @@ def rule_based_sentiment(text: str) -> str | None:
             idx = None
             for i, s in enumerate(spans):
                 if s.start() == m.start():
-                    idx = i; break
+                    idx = i
+                    break
             if idx is None:
                 continue
             if _has_negator_before(spans, idx):
@@ -235,7 +257,7 @@ def vader_sentiment(text: str) -> str:
     else:
         return "mixed"
 
-# ---------- OpenAI (Option B) ----------
+# ---------- OpenAI ----------
 
 SYSTEM_PROMPT = """Extract entities and per-entity sentiment from each Reddit comment.
 
@@ -251,67 +273,94 @@ Return strict JSON following the schema.
 
 JSON_SCHEMA = {
   "type": "object",
+  "additionalProperties": False,
   "properties": {
     "results": {
       "type": "array",
       "items": {
-        "type":"object",
+        "type": "object",
+        "additionalProperties": False,
         "properties": {
-          "comment_id": {"type":"string"},
+          "comment_id": {"type": "string"},
           "entities": {
-            "type":"array",
+            "type": "array",
             "items": {
-              "type":"object",
+              "type": "object",
+              "additionalProperties": False,
               "properties": {
-                "entity_type": {"type":"string","enum":["movie","person"]},
-                "name": {"type":"string"},
-                "sentiment": {"type":"string","enum":["positive","negative","mixed"]}
+                "entity_type": {"type": "string", "enum": ["movie", "person"]},
+                "name": {"type": "string"},
+                "sentiment": {"type": "string", "enum": ["positive", "negative", "mixed"]}
               },
-              "required":["entity_type","name","sentiment"]
+              "required": ["entity_type", "name", "sentiment"]
             }
           }
         },
-        "required":["comment_id","entities"]
+        "required": ["comment_id", "entities"]
       }
     }
   },
-  "required":["results"]
+  "required": ["results"]
 }
 
-def _is_rate_limited(e):
-    typ = type(e).__name__
+def _is_rate_limited(e: BaseException) -> bool:
+    # openai SDK: RateLimitError is a subclass of APIStatusError with status_code 429
     status = getattr(e, "status_code", None)
-    return typ in ("RateLimitError","OpenAIError","APIStatusError") and (status == 429 or status is None)
+    return isinstance(e, RateLimitError) or status == 429
 
-@retry(retry=retry_if_exception(_is_rate_limited), wait=wait_exponential(multiplier=1, min=1, max=30), stop=stop_after_attempt(6))
-def call_openai(batch: List[Dict[str,Any]], model: str):
+
+@retry(
+    retry=retry_if_exception(_is_rate_limited),
+    wait=wait_exponential(multiplier=2, min=5, max=60),
+    stop=stop_after_attempt(3),
+)
+def call_openai(batch: list[dict], model: str) -> dict:
     from openai import OpenAI
-    client = OpenAI()
-    def _trim(txt, limit=900):
+    client = OpenAI(max_retries=0)
+
+    def _trim(txt: str, limit: int = 900) -> str:
         t = txt or ""
         return t if len(t) <= limit else t[:limit] + " …"
-    user_content = [{"type":"text","text":json.dumps({"comment_id":c["id"], "text":_trim(c["body"])})} for c in batch]
-    resp = client.responses.create(
+
+    items = [{"comment_id": c["id"], "text": _trim(c["body"])} for c in batch]
+
+    completion = client.chat.completions.create(
         model=model,
         temperature=0,
-        response_format={"type":"json_schema","json_schema":{"name":"entity_sentiment","schema":JSON_SCHEMA,"strict":True}},
-        input=[
-            {"role":"system","content":[{"type":"text","text":SYSTEM_PROMPT}]},
-            {"role":"user","content":user_content}
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "entity_sentiment",
+                "schema": JSON_SCHEMA,
+                "strict": True,
+            },
+        },
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps({"items": items})},
         ],
     )
-    return resp.output_json
+
+    content = completion.choices[0].message.content
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        data = {"results": []}
+    if "results" not in data:
+        data["results"] = []
+    return data
+
 
 def batched(xs, n):
     for i in range(0, len(xs), n):
-        yield xs[i:i+n]
+        yield xs[i:i + n]
 
 # ---------- Deduplication & Aggregations ----------
 
-def canonicalize_entities(mentions: List[Dict[str,Any]], similarity_threshold: int = 90) -> Tuple[List[Dict[str,Any]], Dict[str,str]]:
+def canonicalize_entities(mentions: List[Dict[str, Any]], similarity_threshold: int = 90) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """Map raw names to canonical names (per type). Prefers prefilled canonical_name (e.g., from TMDB)."""
     by_type_values = defaultdict(list)
-    raw_to_canonical: Dict[str,str] = {}
+    raw_to_canonical: Dict[str, str] = {}
     for m in mentions:
         key = f'{m["entity_type"]}|{m["entity_name"]}'
         if m.get("canonical_name"):
@@ -334,7 +383,9 @@ def canonicalize_entities(mentions: List[Dict[str,Any]], similarity_threshold: i
             for cl in clusters:
                 anchor = cl[0]
                 if fuzz.token_set_ratio(name, anchor) >= similarity_threshold:
-                    cl.append(name); placed = True; break
+                    cl.append(name)
+                    placed = True
+                    break
             if not placed:
                 clusters.append([name])
         for cl in clusters:
@@ -353,7 +404,7 @@ def canonicalize_entities(mentions: List[Dict[str,Any]], similarity_threshold: i
         final_map[f'{m["entity_type"]}|{m["entity_name"]}'] = m["canonical_name"]
     return mentions, final_map
 
-def aggregate(mentions: List[Dict[str,Any]]) -> Dict[str,Any]:
+def aggregate(mentions: List[Dict[str, Any]]) -> Dict[str, Any]:
     global_counts = defaultdict(lambda: Counter())
     author_counts = defaultdict(lambda: defaultdict(lambda: Counter()))
     for m in mentions:
@@ -370,7 +421,7 @@ def aggregate(mentions: List[Dict[str,Any]]) -> Dict[str,Any]:
         top = [k for k, v in c.items() if v == max_val]
         lead_share = max_val / total
         majority = "unclear" if (len(top) > 1 or lead_share < 0.5) else top[0]
-        return {"counts": dict(c), "total": total, "majority": majority, "lead_share": round(lead_share,3)}
+        return {"counts": dict(c), "total": total, "majority": majority, "lead_share": round(lead_share, 3)}
 
     global_summary = [
         {"entity_type": et, "canonical_name": nm, **summarize_counter(cnt)}
@@ -397,50 +448,72 @@ def run_pipeline(
     use_openai: bool = True,
     openai_model: str | None = None,
     batch_size: int = 10,
-    require_tmdb: bool = True
-) -> Dict[str,Any]:
+    require_tmdb: bool = True,
+) -> Dict[str, Any]:
     comments = fetch_comments(thread_url)
-    mentions: List[Dict[str,Any]] = []
+    mentions: List[Dict[str, Any]] = []
 
     if use_openai:
-        model = openai_model or os.getenv("MODEL","gpt-4.1-mini")
+        model = openai_model or os.getenv("MODEL", "gpt-4.1-mini")
+        call_number = 0
+
         for batch in batched(comments, batch_size):
-            out = call_openai(batch, model=model)
+            call_number += 1
+            comment_ids = [c["id"] for c in batch]
+
+            logging.info(
+                f"OpenAI call #{call_number} starting at {datetime.now(timezone.utc).isoformat()} "
+                f"with {len(batch)} comments: {comment_ids}"
+            )
+
+            try:
+                out = call_openai(batch, model=model)
+            except Exception as e:
+                logging.error(f"OpenAI call #{call_number} raised {type(e).__name__}: {e}")
+                response = getattr(e, "response", None)
+                headers = getattr(response, "headers", None)
+                logging.error(f"Headers: {headers}")
+                raise
+
+            # FIX: was datetime.datetime.utcnow() which raised AttributeError
+            # because datetime was imported as `from datetime import datetime`
+            logging.info(
+                f"OpenAI call #{call_number} completed at {datetime.now(timezone.utc).isoformat()}"
+            )
+
             by_id = {c["id"]: c for c in batch}
             for r in out.get("results", []):
-                cid = r["comment_id"]
-                source = by_id.get(cid, {})
-                text = source.get("body") or ""
-                rule_sent = rule_based_sentiment(text)
-                for e in r.get("entities", []):
-                    etype = e["entity_type"]
-                    raw_name = (e["name"] or "").strip()
+                comment_id = r.get("comment_id")
+                comment = by_id.get(comment_id)
+                if not comment:
+                    continue
+                for ent in r.get("entities", []):
+                    name = (ent.get("name") or "").strip()
+                    etype = ent.get("entity_type")
+                    sentiment = ent.get("sentiment")
+                    if not name or not etype or not sentiment:
+                        continue
 
-                    tmdb_item = None
-                    if etype == "movie":
-                        raw_name = expand_movie_name_from_text(raw_name, text)
-                        if not looks_like_title(raw_name):
-                            continue
-                        if TMDB_API_KEY and require_tmdb:
-                            tmdb_item = tmdb_search_movie(raw_name)
-                            if not tmdb_item or fuzz.token_set_ratio(raw_name, (tmdb_item.get("title") or "")) < 85:
-                                continue
-
-                    sent = e["sentiment"]
-                    if rule_sent and sent != rule_sent:
-                        sent = rule_sent
+                    # Resolve movies against TMDB for a clean canonical title+year
+                    canonical = None
+                    if etype == "movie" and TMDB_API_KEY and require_tmdb:
+                        tmdb_result = tmdb_search_movie(name)  # cached
+                        canonical = tmdb_canonical(tmdb_result) if tmdb_result else None
 
                     mentions.append({
                         "entity_type": etype,
-                        "entity_name": raw_name,
-                        "sentiment": sent,
-                        "comment_id": cid,
-                        "author": source.get("author"),
-                        "permalink": source.get("permalink"),
-                        "text": text,
-                        "canonical_name": tmdb_canonical(tmdb_item) if tmdb_item else None,
+                        "entity_name": name,
+                        "canonical_name": canonical,  # None falls back to fuzzy dedup
+                        "sentiment": sentiment,
+                        "comment_id": comment_id,
+                        "author": comment.get("author"),
+                        "permalink": comment.get("permalink"),
+                        "text": comment.get("body"),
                     })
-            time.sleep(0.5)
+
+            # Throttle between batches to stay under rate limits
+            time.sleep(2.0)
+
     else:
         nlp = _get_spacy()
         for c in comments:
@@ -450,13 +523,14 @@ def run_pipeline(
             for ent in doc.ents:
                 if ent.label_ == "PERSON":
                     mentions.append({
-                        "entity_type":"person",
+                        "entity_type": "person",
                         "entity_name": ent.text.strip(),
+                        "canonical_name": None,
                         "sentiment": sent,
                         "comment_id": c["id"],
                         "author": c.get("author"),
                         "permalink": c.get("permalink"),
-                        "text": text
+                        "text": text,
                     })
             movies = [m.strip() for m in QUOTED_TITLE.findall(text)]
             for m in TITLE_SPAN.findall(text):
@@ -465,17 +539,23 @@ def run_pipeline(
                     movies.append(m)
             seen = set()
             for m in movies:
-                if m.lower() in seen: continue
+                if m.lower() in seen:
+                    continue
                 seen.add(m.lower())
                 if looks_like_title(m):
+                    canonical = None
+                    if TMDB_API_KEY and require_tmdb:
+                        tmdb_result = tmdb_search_movie(m)
+                        canonical = tmdb_canonical(tmdb_result) if tmdb_result else None
                     mentions.append({
-                        "entity_type":"movie",
+                        "entity_type": "movie",
                         "entity_name": m,
+                        "canonical_name": canonical,
                         "sentiment": sent,
                         "comment_id": c["id"],
                         "author": c.get("author"),
                         "permalink": c.get("permalink"),
-                        "text": text
+                        "text": text,
                     })
 
     mentions, raw_to_canonical = canonicalize_entities(mentions, similarity_threshold=90)
@@ -486,9 +566,9 @@ def run_pipeline(
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "mentions": mentions,
         "dedupe_map": raw_to_canonical,
-        "aggregates": aggregates
+        "aggregates": aggregates,
     }
 
-def save_json(data: Dict[str,Any], path: str):
+def save_json(data: Dict[str, Any], path: str):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

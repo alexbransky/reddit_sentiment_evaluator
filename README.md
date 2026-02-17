@@ -27,7 +27,7 @@ cp .env.example .env  # edit with your key
 Then:
 ```python
 from pipeline import run_pipeline, save_json
-out = run_pipeline("https://www.reddit.com/r/HollywoodIndia/comments/.../...", use_openai=True, openai_model="gpt-4.1-mini")
+out = run_pipeline("https://www.reddit.com/r/HollywoodIndia/comments/.../...", use_openai=True, openai_model="gpt-4o-mini")
 save_json(out, "results.json")
 ```
 
